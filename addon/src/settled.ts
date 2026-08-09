@@ -1,15 +1,39 @@
-// @ts-ignore: this is private API. This import will work Ember 5.1+ since it
-// "provides" this public API, but does not for earlier versions. As a result,
-// this type will be `any`.
-import { _backburner } from '@ember/runloop';
+import {
+  macroCondition,
+  dependencySatisfies,
+  importSync,
+} from '@embroider/macros';
 import { Test } from 'ember-testing';
 
 import { nextTick } from './-utils.ts';
-import waitUntil from './wait-until.ts';
 import { hasPendingTransitions } from './setup-application-context.ts';
 import { hasPendingWaiters } from '@ember/test-waiters';
 import type DebugInfo from './-internal/debug-info.ts';
 import { TestDebugInfo } from './-internal/debug-info.ts';
+import renderSettled from './-internal/render-settled.ts';
+
+// This is private API. Runloop-less builds of ember-source (the RFC 957
+// spikes) do not export `_backburner` at all, so it is read off the module
+// namespace -- a missing export degrades to `undefined` here instead of a
+// build-time missing-export error in consuming apps.
+const _backburner: any = (importSync('@ember/runloop') as any)._backburner;
+
+// Ember builds that schedule rendering without the runloop expose the
+// synchronous "is work outstanding?" probe directly on the renderer:
+// true while a dirtied renderer awaits its flush or destruction awaits
+// its drain. When present, it answers `isRenderPending` below instead of
+// inferring from backburner's autorun instance.
+const frameworkIsRenderPending: (() => boolean) | null = (() => {
+  if (macroCondition(dependencySatisfies('ember-source', '>=4.5.0-beta.1'))) {
+    const renderer = importSync('@ember/renderer') as any;
+
+    if (typeof renderer.isRenderPending === 'function') {
+      return renderer.isRenderPending;
+    }
+  }
+
+  return null;
+})();
 
 let requests: XMLHttpRequest[];
 const checkWaiters = Test.checkWaiters;
@@ -139,15 +163,17 @@ export interface SettledState {
   @returns {Object} object with properties for each of the metrics used to determine settledness
 */
 export function getSettledState(): SettledState {
-  const hasPendingTimers = _backburner.hasTimers();
-  const hasRunLoop = Boolean(_backburner.currentInstance);
+  const hasPendingTimers = _backburner ? _backburner.hasTimers() : false;
+  const hasRunLoop = _backburner ? Boolean(_backburner.currentInstance) : false;
   const hasPendingLegacyWaiters = checkWaiters();
   const hasPendingTestWaiters = hasPendingWaiters();
   const pendingRequestCount = pendingRequests();
   const hasPendingRequests = pendingRequestCount > 0;
-  // TODO: Ideally we'd have a function in Ember itself that can synchronously identify whether
-  // or not there are any pending render operations, but this will have to suffice for now
-  const isRenderPending = !!hasRunLoop;
+  // On runloop-driven builds, a pending render is observable as backburner's
+  // autorun instance; scheduler-driven builds answer the question directly.
+  const isRenderPending = frameworkIsRenderPending
+    ? frameworkIsRenderPending()
+    : !!hasRunLoop;
 
   return {
     hasPendingTimers,
@@ -209,6 +235,25 @@ export function isSettled(): boolean {
   @public
   @returns {Promise<void>} resolves when settled
 */
-export default function settled(): Promise<void> {
-  return waitUntil(isSettled, { timeout: Infinity }).then(() => {});
+export default async function settled(): Promise<void> {
+  // The render half of settledness is event-driven rather than polled:
+  // `renderSettled()` resolves once rendering has completed (on
+  // scheduler-driven builds, at the end of a flush that left every
+  // renderer valid). Only the poll-only conditions -- test waiters,
+  // pending requests, transitions -- need re-checking in a loop.
+  //
+  // Quiet must be confirmed FROM A MACROTASK: task sources that are
+  // already queued (worker messages, zero-delay timers) may re-register
+  // waiters or dirty tracked state, and an observation made in microtask
+  // context would win the race against them and settle early. The
+  // previous waitUntil-based implementation imposed this boundary
+  // implicitly by scheduling every check via setTimeout.
+  for (;;) {
+    await renderSettled();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    if (isSettled()) {
+      return;
+    }
+  }
 }
