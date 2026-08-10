@@ -8,6 +8,7 @@ import { Test } from 'ember-testing';
 import { nextTick } from './-utils.ts';
 import { hasPendingTransitions } from './setup-application-context.ts';
 import { buildWaiter, hasPendingWaiters } from '@ember/test-waiters';
+import * as testWaiters from '@ember/test-waiters';
 import type DebugInfo from './-internal/debug-info.ts';
 import { TestDebugInfo } from './-internal/debug-info.ts';
 import renderSettled from './-internal/render-settled.ts';
@@ -250,22 +251,88 @@ export function isSettled(): boolean {
   @public
   @returns {Promise<void>} resolves when settled
 */
+/**
+ * Waiter completion is announced by `@ember/test-waiters` versions that
+ * export `waitersSettled`; older ones are pull-only, and the fallback
+ * tick below drives the loop instead.
+ *
+ * @private
+ */
+const maybeWaitersSettled = (
+  testWaiters as unknown as { waitersSettled?: () => Promise<unknown> }
+).waitersSettled;
+
+const waitersSettled: (() => Promise<unknown>) | null =
+  typeof maybeWaitersSettled === 'function' ? maybeWaitersSettled : null;
+
+/**
+ * How long the fallback tick waits.
+ *
+ * When waiters announce completion, this tick is a safety net for the
+ * sources that cannot: `Waiter` implementations written against the
+ * interface directly, legacy `Ember.Test.registerWaiter` callbacks, and
+ * request counters. It must then comfortably exceed a frame, because a
+ * render tick can be frame-paced -- at 10ms it beat rendering to the
+ * race often enough to decide a quarter of all iterations (measured 30
+ * of 117), costing an extra pass each time; at 50ms it decided 1 of 92.
+ *
+ * Without waiter notification it is the loop's only clock, so it stays
+ * at the cadence the previous `waitUntil`-based implementation used.
+ *
+ * @private
+ */
+const FALLBACK_MS = waitersSettled === null ? 10 : 50;
+
+function fallbackTick(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, FALLBACK_MS));
+}
+
+/**
+ * Resolves when no waiter is pending, on versions that can tell us.
+ * Otherwise never resolves, leaving the fallback tick to drive.
+ *
+ * @private
+ */
+function waitersQuiet(): Promise<unknown> {
+  return waitersSettled === null ? new Promise(() => {}) : waitersSettled();
+}
+
+/**
+ * Yields to the task queue, so quiet is observed from a macrotask.
+ *
+ * @private
+ */
+function macrotask(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 export default async function settled(): Promise<void> {
-  // The render half of settledness is event-driven rather than polled:
-  // `renderSettled()` resolves once rendering has completed (on
-  // scheduler-driven builds, at the end of a flush that left every
-  // renderer valid). Only the poll-only conditions -- test waiters,
-  // pending requests, transitions -- need re-checking in a loop.
+  // Settledness is awaited rather than polled: rendering resolves
+  // `renderSettled()` when it completes, and waiters resolve
+  // `waitersSettled()` from the operations' own completion promises. The
+  // fallback tick is raced alongside them only to cover sources that
+  // cannot announce completion -- when everything announces, it never
+  // decides anything.
   //
-  // Quiet must be confirmed FROM A MACROTASK: task sources that are
-  // already queued (worker messages, zero-delay timers) may re-register
-  // waiters or dirty tracked state, and an observation made in microtask
-  // context would win the race against them and settle early. The
-  // previous waitUntil-based implementation imposed this boundary
-  // implicitly by scheduling every check via setTimeout.
+  // Two properties this loop must preserve:
+  //
+  // 1. Quiet is confirmed FROM A MACROTASK. Task sources that are
+  //    already queued (worker messages, zero-delay timers) may register
+  //    waiters or dirty tracked state, and an observation made in
+  //    microtask context would win the race against them and settle
+  //    early. The previous waitUntil-based implementation imposed this
+  //    boundary implicitly by scheduling every check via setTimeout.
+  //
+  // 2. It re-checks. Completing the work that was pending can start
+  //    more of it, so one pass proves nothing; the loop runs until a
+  //    pass observes everything quiet.
   for (;;) {
-    await renderSettled();
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await Promise.race([
+      Promise.all([renderSettled(), waitersQuiet()]),
+      fallbackTick(),
+    ]);
+
+    await macrotask();
 
     if (isSettled()) {
       return;
