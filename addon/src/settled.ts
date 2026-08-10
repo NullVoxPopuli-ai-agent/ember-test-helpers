@@ -1,14 +1,9 @@
-import {
-  macroCondition,
-  dependencySatisfies,
-  importSync,
-} from '@embroider/macros';
+import { importSync } from '@embroider/macros';
 import { Test } from 'ember-testing';
 
 import { nextTick } from './-utils.ts';
 import { hasPendingTransitions } from './setup-application-context.ts';
-import { buildWaiter, hasPendingWaiters } from '@ember/test-waiters';
-import * as testWaiters from '@ember/test-waiters';
+import { hasPendingWaiters, waitersSettled } from '@ember/test-waiters';
 import type DebugInfo from './-internal/debug-info.ts';
 import { TestDebugInfo } from './-internal/debug-info.ts';
 import renderSettled from './-internal/render-settled.ts';
@@ -18,38 +13,6 @@ import renderSettled from './-internal/render-settled.ts';
 // namespace -- a missing export degrades to `undefined` here instead of a
 // build-time missing-export error in consuming apps.
 const _backburner: any = (importSync('@ember/runloop') as any)._backburner;
-
-// Ember builds that schedule rendering without the runloop report the
-// EDGES of rendering work (pending / complete) rather than exposing a
-// pollable flag. Bridging those edges into a test waiter folds rendering
-// into the same settledness protocol as every other async source: it
-// needs no clause of its own in `isSettled` below, and a render that
-// never completes is reported by name in test-waiter debug output.
-const renderWaiter = buildWaiter('@ember/test-helpers:render');
-let renderWaiterToken: unknown = null;
-
-const usesRenderWaiter = (() => {
-  if (macroCondition(dependencySatisfies('ember-source', '>=4.5.0-beta.1'))) {
-    const renderer = importSync('@ember/renderer') as any;
-
-    if (typeof renderer._onRenderSettledChange === 'function') {
-      renderer._onRenderSettledChange((pending: boolean) => {
-        if (pending) {
-          renderWaiterToken ??= renderWaiter.beginAsync();
-        } else if (renderWaiterToken !== null) {
-          const token = renderWaiterToken;
-
-          renderWaiterToken = null;
-          renderWaiter.endAsync(token);
-        }
-      });
-
-      return true;
-    }
-  }
-
-  return false;
-})();
 
 let requests: XMLHttpRequest[];
 const checkWaiters = Test.checkWaiters;
@@ -185,11 +148,10 @@ export function getSettledState(): SettledState {
   const hasPendingTestWaiters = hasPendingWaiters();
   const pendingRequestCount = pendingRequests();
   const hasPendingRequests = pendingRequestCount > 0;
-  // On runloop-driven builds, a pending render is observable as backburner's
-  // autorun instance. Scheduler-driven builds report render edges into the
-  // render waiter above, so a pending render is already counted in
-  // `hasPendingTestWaiters` -- reporting it here too would double-count it.
-  const isRenderPending = usesRenderWaiter ? false : !!hasRunLoop;
+  // On runloop-driven builds a pending render is observable as backburner's
+  // autorun instance. Builds that schedule without the runloop have nothing
+  // to observe here -- `settled()` awaits `renderSettled()` directly.
+  const isRenderPending = !!hasRunLoop;
 
   return {
     hasPendingTimers,
@@ -251,88 +213,36 @@ export function isSettled(): boolean {
   @public
   @returns {Promise<void>} resolves when settled
 */
-/**
- * Waiter completion is announced by `@ember/test-waiters` versions that
- * export `waitersSettled`; older ones are pull-only, and the fallback
- * tick below drives the loop instead.
- *
- * @private
- */
-const maybeWaitersSettled = (
-  testWaiters as unknown as { waitersSettled?: () => Promise<unknown> }
-).waitersSettled;
-
-const waitersSettled: (() => Promise<unknown>) | null =
-  typeof maybeWaitersSettled === 'function' ? maybeWaitersSettled : null;
-
-/**
- * How long the fallback tick waits.
- *
- * When waiters announce completion, this tick is a safety net for the
- * sources that cannot: `Waiter` implementations written against the
- * interface directly, legacy `Ember.Test.registerWaiter` callbacks, and
- * request counters. It must then comfortably exceed a frame, because a
- * render tick can be frame-paced -- at 10ms it beat rendering to the
- * race often enough to decide a quarter of all iterations (measured 30
- * of 117), costing an extra pass each time; at 50ms it decided 1 of 92.
- *
- * Without waiter notification it is the loop's only clock, so it stays
- * at the cadence the previous `waitUntil`-based implementation used.
- *
- * @private
- */
-const FALLBACK_MS = waitersSettled === null ? 10 : 50;
-
-function fallbackTick(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, FALLBACK_MS));
-}
-
-/**
- * Resolves when no waiter is pending, on versions that can tell us.
- * Otherwise never resolves, leaving the fallback tick to drive.
- *
- * @private
- */
-function waitersQuiet(): Promise<unknown> {
-  return waitersSettled === null ? new Promise(() => {}) : waitersSettled();
-}
-
-/**
- * Yields to the task queue, so quiet is observed from a macrotask.
- *
- * @private
- */
-function macrotask(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 0));
-}
-
 export default async function settled(): Promise<void> {
-  // Settledness is awaited rather than polled: rendering resolves
+  // Settledness is awaited, not polled: rendering resolves
   // `renderSettled()` when it completes, and waiters resolve
-  // `waitersSettled()` from the operations' own completion promises. The
-  // fallback tick is raced alongside them only to cover sources that
-  // cannot announce completion -- when everything announces, it never
-  // decides anything.
+  // `waitersSettled()` from their operations' own completion promises.
   //
-  // Two properties this loop must preserve:
+  // The timers are not a polling cadence, and both are load-bearing:
   //
-  // 1. Quiet is confirmed FROM A MACROTASK. Task sources that are
-  //    already queued (worker messages, zero-delay timers) may register
-  //    waiters or dirty tracked state, and an observation made in
-  //    microtask context would win the race against them and settle
-  //    early. The previous waitUntil-based implementation imposed this
-  //    boundary implicitly by scheduling every check via setTimeout.
+  // - The 50ms race covers what cannot announce completion: run loop
+  //   timers, legacy `Ember.Test.registerWaiter` callbacks, request
+  //   counters, and `Waiter` implementations that do not implement
+  //   `settled`. Without it, `settled()` returns while those are still
+  //   pending. It is 50ms rather than 10 so that it loses the race to a
+  //   frame-paced render tick; at 10ms it decided 30 of 117 iterations
+  //   and cost an extra pass each time. In practice the promises decide
+  //   (measured 91 of 92 iterations).
   //
-  // 2. It re-checks. Completing the work that was pending can start
-  //    more of it, so one pass proves nothing; the loop runs until a
-  //    pass observes everything quiet.
+  // - The 0ms yield makes quiet observable from a macrotask. Task
+  //   sources already queued (worker messages, zero-delay timers) can
+  //   register waiters or dirty tracked state, and an observation made
+  //   in microtask context wins the race against them and settles
+  //   early.
+  //
+  // The loop re-checks because settling can start more work.
   for (;;) {
     await Promise.race([
-      Promise.all([renderSettled(), waitersQuiet()]),
-      fallbackTick(),
+      Promise.all([renderSettled(), waitersSettled()]),
+      new Promise((resolve) => setTimeout(resolve, 50)),
     ]);
 
-    await macrotask();
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     if (isSettled()) {
       return;
