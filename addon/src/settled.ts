@@ -7,7 +7,7 @@ import { Test } from 'ember-testing';
 
 import { nextTick } from './-utils.ts';
 import { hasPendingTransitions } from './setup-application-context.ts';
-import { hasPendingWaiters } from '@ember/test-waiters';
+import { buildWaiter, hasPendingWaiters } from '@ember/test-waiters';
 import type DebugInfo from './-internal/debug-info.ts';
 import { TestDebugInfo } from './-internal/debug-info.ts';
 import renderSettled from './-internal/render-settled.ts';
@@ -18,21 +18,36 @@ import renderSettled from './-internal/render-settled.ts';
 // build-time missing-export error in consuming apps.
 const _backburner: any = (importSync('@ember/runloop') as any)._backburner;
 
-// Ember builds that schedule rendering without the runloop expose the
-// synchronous "is work outstanding?" probe directly on the renderer:
-// true while a dirtied renderer awaits its flush or destruction awaits
-// its drain. When present, it answers `isRenderPending` below instead of
-// inferring from backburner's autorun instance.
-const frameworkIsRenderPending: (() => boolean) | null = (() => {
+// Ember builds that schedule rendering without the runloop report the
+// EDGES of rendering work (pending / complete) rather than exposing a
+// pollable flag. Bridging those edges into a test waiter folds rendering
+// into the same settledness protocol as every other async source: it
+// needs no clause of its own in `isSettled` below, and a render that
+// never completes is reported by name in test-waiter debug output.
+const renderWaiter = buildWaiter('@ember/test-helpers:render');
+let renderWaiterToken: unknown = null;
+
+const usesRenderWaiter = (() => {
   if (macroCondition(dependencySatisfies('ember-source', '>=4.5.0-beta.1'))) {
     const renderer = importSync('@ember/renderer') as any;
 
-    if (typeof renderer.isRenderPending === 'function') {
-      return renderer.isRenderPending;
+    if (typeof renderer._onRenderSettledChange === 'function') {
+      renderer._onRenderSettledChange((pending: boolean) => {
+        if (pending) {
+          renderWaiterToken ??= renderWaiter.beginAsync();
+        } else if (renderWaiterToken !== null) {
+          const token = renderWaiterToken;
+
+          renderWaiterToken = null;
+          renderWaiter.endAsync(token);
+        }
+      });
+
+      return true;
     }
   }
 
-  return null;
+  return false;
 })();
 
 let requests: XMLHttpRequest[];
@@ -170,10 +185,10 @@ export function getSettledState(): SettledState {
   const pendingRequestCount = pendingRequests();
   const hasPendingRequests = pendingRequestCount > 0;
   // On runloop-driven builds, a pending render is observable as backburner's
-  // autorun instance; scheduler-driven builds answer the question directly.
-  const isRenderPending = frameworkIsRenderPending
-    ? frameworkIsRenderPending()
-    : !!hasRunLoop;
+  // autorun instance. Scheduler-driven builds report render edges into the
+  // render waiter above, so a pending render is already counted in
+  // `hasPendingTestWaiters` -- reporting it here too would double-count it.
+  const isRenderPending = usesRenderWaiter ? false : !!hasRunLoop;
 
   return {
     hasPendingTimers,
