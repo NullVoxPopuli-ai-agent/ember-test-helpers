@@ -6,10 +6,8 @@ import { Registry } from '@ember/-internals/container';
 
 import type { FullName } from '@ember/owner';
 
-import {
-  ContainerProxyMixin,
-  RegistryProxyMixin,
-} from '@ember/-internals/runtime';
+import { assert } from '@ember/debug';
+import { join, schedule } from '@ember/runloop';
 
 /**
  * Adds methods that are normally only on registry to the container. This is largely to support the legacy APIs
@@ -45,30 +43,91 @@ function exposeRegistryMethodsWithoutDeprecations(container: any) {
   }
 }
 
-// `EmberObject.extend()` is part of the classic class system, which Ember
-// deprecates (RFC 1117). So the mixins go onto the prototype of a native
-// base class. `Owner` can then override their methods.
-class OwnerBase extends EmberObject {}
-
-RegistryProxyMixin.apply(OwnerBase.prototype);
-ContainerProxyMixin.apply(OwnerBase.prototype);
-
 // NOTE: this is the same as what `EngineInstance`/`ApplicationInstance`
 // implement, and is thus a superset of the `InternalOwner` contract from Ember
 // itself.
-// The interface reflects the mixins applied to `OwnerBase`.
-// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
-interface Owner extends RegistryProxyMixin, ContainerProxyMixin {}
-// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
-class Owner extends OwnerBase {
+//
+// Ember builds its owners from `RegistryProxyMixin` and `ContainerProxyMixin`.
+// Mixins and `EmberObject.extend()` are part of the classic class system,
+// which Ember deprecates (RFC 1117). So this class has the methods of both
+// mixins as native methods.
+class Owner extends EmberObject {
   _emberTestHelpersMockOwner = true;
+
+  // SAFETY: these are private API. `buildRegistry` sets both.
+  declare __registry__: any;
+  declare __container__: any;
+
+  resolveRegistration(fullName: FullName) {
+    assert(
+      'fullName must be a proper full name',
+      this.__registry__.isValidFullName(fullName),
+    );
+
+    return this.__registry__.resolve(fullName);
+  }
+
+  register(...args: unknown[]) {
+    return this.__registry__.register(...args);
+  }
+
+  hasRegistration(...args: unknown[]) {
+    return this.__registry__.has(...args);
+  }
+
+  registeredOption(...args: unknown[]) {
+    return this.__registry__.getOption(...args);
+  }
+
+  registerOptions(...args: unknown[]) {
+    return this.__registry__.options(...args);
+  }
+
+  registeredOptions(...args: unknown[]) {
+    return this.__registry__.getOptions(...args);
+  }
+
+  registerOptionsForType(...args: unknown[]) {
+    return this.__registry__.optionsForType(...args);
+  }
+
+  registeredOptionsForType(...args: unknown[]) {
+    return this.__registry__.getOptionsForType(...args);
+  }
+
+  ownerInjection() {
+    return this.__container__.ownerInjection();
+  }
+
+  lookup(fullName: FullName, options?: object) {
+    return this.__container__.lookup(fullName, options);
+  }
+
+  factoryFor(fullName: FullName) {
+    return this.__container__.factoryFor(fullName);
+  }
+
+  // `willDestroy()` runs later than this method, and `ContainerProxyMixin`
+  // destroys the container here.
+  // eslint-disable-next-line ember/classic-decorator-hooks
+  destroy() {
+    const container = this.__container__;
+
+    if (container) {
+      join(() => {
+        container.destroy();
+        schedule('destroy', container, 'finalizeDestroy');
+      });
+    }
+
+    return super.destroy();
+  }
 
   /* eslint-disable valid-jsdoc */
   /**
    * Unregister a factory and its instance.
    *
-   * Overrides `RegistryProxy#unregister` in order to clear any cached instances
-   * of the unregistered factory.
+   * Also clears any cached instances of the unregistered factory.
    *
    * @param {string} fullName Name of the factory to unregister.
    *
@@ -77,14 +136,8 @@ class Owner extends OwnerBase {
    */
   /* eslint-enable valid-jsdoc */
   unregister(fullName: FullName) {
-    // SAFETY: this is always present, but only the stable type definitions from
-    // Ember actually preserve it, since it is private API.
-    (this as any)['__container__'].reset(fullName);
-
-    // We overwrote this method from RegistryProxyMixin.
-    // SAFETY: this is always present, but only the stable type definitions from
-    // Ember actually preserve it, since it is private API.
-    (this as any)['__registry__'].unregister(fullName);
+    this.__container__.reset(fullName);
+    this.__registry__.unregister(fullName);
   }
 }
 
