@@ -1,7 +1,7 @@
 import type { Resolver } from '@ember/owner';
 import ApplicationInstance from '@ember/application/instance';
 import Application from '@ember/application';
-import EmberObject from '@ember/object';
+import { destroy, isDestroyed, isDestroying } from '@ember/destroyable';
 import { Registry } from '@ember/-internals/container';
 
 import type { FullName } from '@ember/owner';
@@ -47,16 +47,28 @@ function exposeRegistryMethodsWithoutDeprecations(container: any) {
 // implement, and is thus a superset of the `InternalOwner` contract from Ember
 // itself.
 //
-// Ember builds its owners from `RegistryProxyMixin` and `ContainerProxyMixin`.
-// Mixins and `EmberObject.extend()` are part of the classic class system,
-// which Ember deprecates (RFC 1117). So this class has the methods of both
-// mixins as native methods.
-class Owner extends EmberObject {
+// Ember builds its owners from `EmberObject`, `RegistryProxyMixin` and
+// `ContainerProxyMixin`. Those are part of the classic class system, which
+// Ember deprecates (RFC 1117). So this is a plain class that has the methods
+// of both mixins.
+class Owner {
   _emberTestHelpersMockOwner = true;
 
-  // SAFETY: these are private API. `buildRegistry` sets both.
-  declare __registry__: any;
-  declare __container__: any;
+  // SAFETY: these are private API.
+  __registry__: any;
+  __container__: any;
+
+  constructor(registry: unknown) {
+    this.__registry__ = registry;
+  }
+
+  get isDestroying() {
+    return isDestroying(this);
+  }
+
+  get isDestroyed() {
+    return isDestroyed(this);
+  }
 
   resolveRegistration(fullName: FullName) {
     assert(
@@ -107,9 +119,6 @@ class Owner extends EmberObject {
     return this.__container__.factoryFor(fullName);
   }
 
-  // `willDestroy()` runs later than this method, and `ContainerProxyMixin`
-  // destroys the container here.
-  // eslint-disable-next-line ember/classic-decorator-hooks
   destroy() {
     const container = this.__container__;
 
@@ -120,7 +129,9 @@ class Owner extends EmberObject {
       });
     }
 
-    return super.destroy();
+    destroy(this);
+
+    return this;
   }
 
   /* eslint-disable valid-jsdoc */
@@ -179,21 +190,7 @@ export default function buildRegistry(resolver: Resolver) {
   // @ts-ignore: this is private API.
   registry.describe = fallbackRegistry.describe;
 
-  const owner = Owner.create({
-    // @ts-ignore -- we do not have type safety for `Object.extend` so the type
-    // of `Owner` here is just `EmberObject`, but we *do* constrain it to allow
-    // only types from the actual class, so these fields are not accepted.
-    // However, we can see that they are valid, based on the definition of
-    // `Owner` above given that it fulfills the `InternalOwner` contract and
-    // also extends it just as `EngineInstance` does internally.
-    //
-    // NOTE: we use an `ignore` directive rather than `expect-error` because in
-    // *some* versions of the types, we *do* have (at least some of) this
-    // safety, and maximal backwards compatibility means we have to account for
-    // that.
-    __registry__: registry,
-    __container__: null as any,
-  }) as unknown as Owner;
+  const owner = new Owner(registry);
 
   // @ts-ignore: this is private API.
   const container = registry.container({ owner: owner });
