@@ -45,18 +45,22 @@ function exposeRegistryMethodsWithoutDeprecations(container: any) {
   }
 }
 
+// `EmberObject.extend()` is part of the classic class system, which Ember
+// deprecates (RFC 1117). So the mixins go onto the prototype of a native
+// base class. `Owner` can then override their methods.
+class OwnerBase extends EmberObject {}
+
+RegistryProxyMixin.apply(OwnerBase.prototype);
+ContainerProxyMixin.apply(OwnerBase.prototype);
+
 // NOTE: this is the same as what `EngineInstance`/`ApplicationInstance`
 // implement, and is thus a superset of the `InternalOwner` contract from Ember
 // itself.
-// This is the same merging pattern Ember itself uses for `Engine` etc.: the
-// interface reflects the mixins actually applied in the `extends` clause.
+// The interface reflects the mixins applied to `OwnerBase`.
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
 interface Owner extends RegistryProxyMixin, ContainerProxyMixin {}
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
-class Owner extends EmberObject.extend(
-  RegistryProxyMixin,
-  ContainerProxyMixin,
-) {
+class Owner extends OwnerBase {
   _emberTestHelpersMockOwner = true;
 
   /* eslint-disable valid-jsdoc */
