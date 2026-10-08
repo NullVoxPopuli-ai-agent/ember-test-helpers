@@ -46,15 +46,27 @@ function exposeRegistryMethodsWithoutDeprecations(container: any) {
 // NOTE: this is the same as what `EngineInstance`/`ApplicationInstance`
 // implement, and is thus a superset of the `InternalOwner` contract from Ember
 // itself.
-//
-// Ember builds its owners from `EmberObject`, `RegistryProxyMixin` and
-// `ContainerProxyMixin`. Those are part of the classic class system, which
-// Ember deprecates (RFC 1117). So this is a plain class that has the methods
-// of both mixins.
+
+/**
+ * A plain class, with no `EmberObject` and no mixins.
+ *
+ * Ember builds its owners from:
+ * - `EmberObject`
+ * - `RegistryProxyMixin`
+ * - `ContainerProxyMixin`
+ *
+ * Ember deprecates these:
+ * - RFC 1117 deprecates classic classes.
+ * - RFC 1234 deprecates `EmberObject`.
+ *
+ * So this class has the methods of both mixins as its own methods.
+ */
 class Owner {
   _emberTestHelpersMockOwner = true;
 
-  // SAFETY: these are private API.
+  /**
+   * SAFETY: these are private API.
+   */
   __registry__: any;
   __container__: any;
 
